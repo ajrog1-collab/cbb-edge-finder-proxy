@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import requests
 import os
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -125,30 +125,47 @@ def get_ratings():
 
 @app.route('/api/games')
 def get_games():
-    """Proxy for CollegeBasketballData - Get games"""
+    """Proxy for CollegeBasketballData - Get games with date filtering"""
     if not CBBD_API_KEY:
         return jsonify({"error": "CBBD_API_KEY not configured"}), 500
     
     season = request.args.get('season', '2026')
     
+    # Get date range - default to last 30 days through today
+    today = date.today()
+    default_start = (today - timedelta(days=30)).isoformat()
+    default_end = today.isoformat()
+    
+    start_date = request.args.get('startDate', default_start)
+    end_date = request.args.get('endDate', default_end)
+    
     try:
         url = f"{CBBD_API_BASE}/games"
-        params = {'season': season}
+        params = {
+            'season': season,
+            'startDateRange': start_date,
+            'endDateRange': end_date
+        }
         headers = {
             'Authorization': f'Bearer {CBBD_API_KEY}',
             'Content-Type': 'application/json'
         }
         
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] 📅 Fetching games from {start_date} to {end_date}")
+        
         response = requests.get(url, params=params, headers=headers, timeout=30)
         
         if response.status_code == 200:
+            games = response.json()
             stats = increment_usage()
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Games fetched ({stats['today']}/{DAILY_LIMIT} today)")
-            return jsonify(response.json())
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ✅ Games fetched: {len(games)} games ({stats['today']}/{DAILY_LIMIT} today)")
+            return jsonify(games)
         else:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Games API error: {response.status_code}")
             return jsonify({"error": f"API returned {response.status_code}"}), response.status_code
             
     except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ❌ Games error: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/api/teams')
