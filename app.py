@@ -729,7 +729,7 @@ def get_value():
     """Bets where Polymarket's price is below the sportsbook consensus (no-vig) probability.
     Edge = books' fair probability - Polymarket price. Uses only books posting the same line."""
     try:
-        min_edge = float(request.args.get("minEdge", "0.03"))
+        min_edge = float(request.args.get("minEdge", "0.02"))
     except ValueError:
         raise BadRequest("minEdge must be a number like 0.03")
     odds = cached("odds", 300, lambda: odds_get("/sports/basketball_ncaab/odds/", {
