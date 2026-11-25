@@ -40,4 +40,5 @@ Open `https://<your-proxy>.onrender.com/api/diagnose` in a browser. Each check s
 ## Polymarket
 `/api/polymarket` returns open NCAAB game markets (moneyline, spreads, totals) with each side's price,
 American-odds equivalent, and breakeven %. Data comes from Polymarket's free public API (no key).
+If the site shows no Polymarket prices, open `/api/polymarket/debug` and send the output for troubleshooting.
 `tradeUrl` points to Polymarket US (the regulated US exchange). Override with env var `POLYMARKET_TRADE_URL`.
