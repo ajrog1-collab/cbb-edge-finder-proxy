@@ -558,27 +558,73 @@ def get_polymarket():
     return jsonify(cached("poly:ncaab", 300, fetch_poly_ncaab))
 
 
+# Backtests take a few minutes on a small server, so they run in the background.
+_backtests = {}
+_backtests_lock = threading.Lock()
+
+
+def _run_backtest_job(key, season, kw):
+    from model import run_backtest
+
+    def progress(msg):
+        with _backtests_lock:
+            _backtests[key]["step"] = msg
+
+    try:
+        s_start, s_end = season_window(season)
+        end = min(today_et(), s_end)
+        progress("Downloading games")
+        games = fetch_ranged("/games", season, s_start, end, "games")
+        progress(f"Downloading betting lines ({len(games)} games found)")
+        lines = fetch_ranged("/lines", season, s_start, end, "lines")
+        progress(f"Running model ({len(lines)} line records)")
+        result = run_backtest(games, lines, progress=progress, **kw)
+        result["season"] = season
+        with _backtests_lock:
+            _backtests[key].update(status="done", result=result, finishedAt=datetime.utcnow().isoformat() + "Z")
+    except UpstreamError as e:
+        with _backtests_lock:
+            _backtests[key].update(status="error", error=e.message)
+    except Exception as e:  # pragma: no cover
+        import traceback
+        tb = traceback.extract_tb(e.__traceback__)
+        with _backtests_lock:
+            _backtests[key].update(status="error", error=f"{e.__class__.__name__}: {e}",
+                                   where=[f"{f.filename.split('/')[-1]}:{f.lineno} in {f.name}" for f in tb[-3:]])
+
+
 @app.route("/api/backtest")
 def backtest():
-    """Leak-free walk-forward test of the rebuilt model on a finished season. Default: last season."""
-    from model import run_backtest
+    """Leak-free walk-forward test of the rebuilt model on a finished season (default: last season).
+    First visit starts the test; refresh the page to check progress and see results."""
     season = parse_season(request.args.get("season") or str(current_season() - 1))
-    s_start, s_end = season_window(season)
-    end = min(today_et(), s_end)
-    key = f"backtest:{season}:{request.query_string.decode()}"
+    kw = {}
+    for arg, name in (("lambdaSpread", "lam_spread"), ("lambdaTotal", "lam_total"), ("halfLife", "half_life")):
+        if request.args.get(arg):
+            try:
+                kw[name] = float(request.args[arg])
+            except ValueError:
+                raise BadRequest(f"{arg} must be a number")
+    key = f"{season}:{sorted(kw.items())}"
+    restart = request.args.get("rerun") == "1"
 
-    def run():
-        games = fetch_ranged("/games", season, s_start, end, "games")
-        lines = fetch_ranged("/lines", season, s_start, end, "lines")
-        kw = {}
-        for arg, name, cast in (("lambdaSpread", "lam_spread", float), ("lambdaTotal", "lam_total", float),
-                                ("halfLife", "half_life", float)):
-            if request.args.get(arg):
-                kw[name] = cast(request.args[arg])
-        result = run_backtest(games, lines, **kw)
-        result["season"] = season
-        return result
-    return jsonify(cached(key, 6 * 3600, run))
+    with _backtests_lock:
+        job = _backtests.get(key)
+        if job is None or restart or job["status"] == "error":
+            job = {"status": "running", "step": "Starting", "season": season,
+                   "startedAt": time.time()}
+            _backtests[key] = job
+            threading.Thread(target=_run_backtest_job, args=(key, season, kw), daemon=True).start()
+        snapshot = dict(job)
+
+    if snapshot["status"] == "done":
+        return jsonify(snapshot["result"])
+    elapsed = int(time.time() - snapshot["startedAt"])
+    if snapshot["status"] == "error":
+        return jsonify({"status": "error", "error": snapshot.get("error"), "where": snapshot.get("where"),
+                        "note": "Refresh to try again."}), 500
+    return jsonify({"status": "running", "step": snapshot["step"], "elapsedSeconds": elapsed,
+                    "note": "Still working. Refresh this page in about 30 seconds."})
 
 
 @app.route("/api/diagnose")
