@@ -355,20 +355,37 @@ def _american(p):
     return round(-100 * p / (1 - p)) if p >= 0.5 else round(100 * (1 - p) / p)
 
 
-def ncaab_sport_entry():
+CBB_SPORT_KEYS = ("cbb", "ncaab", "ncaam", "mbb", "cbk")
+
+
+def _is_cbb(s):
+    key = str(s.get("sport", "")).lower()
+    name = str(s.get("name", "")).lower()
+    if "women" in name or key.startswith("w"):
+        return False
+    return key in CBB_SPORT_KEYS or "college basketball" in name or "ncaa basketball" in name
+
+
+def cbb_sport_entries():
+    """All men's college basketball entries. 'ncaab' is March Madness futures; regular-season games live under 'cbb'."""
     def fetch():
         sports = gamma_get("/sports")
-        return next((s for s in sports if s.get("sport") in ("ncaab", "cbb")), {}), sports
+        return [s for s in sports if _is_cbb(s)], sports
     return cached("poly:sports", 86400, fetch)
+
+
+def ncaab_sport_entry():
+    entries, sports = cbb_sport_entries()
+    return (entries[0] if entries else {}), sports
 
 
 def ncaab_tag_ids():
     """Find tags unique to NCAAB (drops generic tags shared with other sports)."""
     def fetch():
-        _, sports = ncaab_sport_entry()
-        by_sport = {s.get("sport"): {t for t in str(s.get("tags", "")).split(",") if t} for s in sports}
-        mine = by_sport.get("ncaab") or by_sport.get("cbb") or set()
-        others = set().union(*[v for k, v in by_sport.items() if k not in ("ncaab", "cbb")]) if by_sport else set()
+        entries, sports = cbb_sport_entries()
+        tagset = lambda e: {t for t in str(e.get("tags", "")).split(",") if t}
+        mine = set().union(*[tagset(e) for e in entries]) if entries else set()
+        others = set().union(*[tagset(e) for e in sports if not _is_cbb(e)]) if sports else set()
         specific = mine - others
         return sorted(specific or mine)
     return cached("poly:ncaab_tags", 86400, fetch)
@@ -418,10 +435,11 @@ def _event_start(e):
 
 def fetch_poly_events():
     """Open NCAAB events, found by NCAAB tag(s) and, if Polymarket lists one, the NCAAB series."""
-    entry, _ = ncaab_sport_entry()
+    entries, _ = cbb_sport_entries()
     queries = [{"tag_id": t} for t in ncaab_tag_ids()]
-    if entry.get("series"):
-        queries.append({"series_id": entry["series"]})
+    for e in entries:
+        if e.get("series"):
+            queries.append({"series_id": e["series"]})
     events = []
     for q in queries:
         cursor = None
@@ -485,12 +503,16 @@ def fetch_poly_ncaab():
 @app.route("/api/polymarket/debug")
 def polymarket_debug():
     """Shows what Polymarket returned, to troubleshoot matching. Not used by the site."""
-    entry, _ = ncaab_sport_entry()
+    entries, sports = cbb_sport_entries()
     events = fetch_poly_events()
-    sample = events[0] if events else {}
+    # Prefer a game-looking event (title with "vs") as the sample
+    sample = next((e for e in events if " vs" in str(e.get("title", "")).lower()), events[0] if events else {})
     m0 = (sample.get("markets") or [{}])[0] if sample else {}
     return jsonify({
-        "sportEntry": entry,
+        "cbbSportEntries": [{k: e.get(k) for k in ("sport", "name", "tags", "series")} for e in entries],
+        "basketballLikeSports": [{k: e.get(k) for k in ("sport", "name", "series")} for e in sports
+                                 if any(w in (str(e.get("sport", "")) + " " + str(e.get("name", ""))).lower()
+                                        for w in ("bask", "cb", "ncaa", "college"))],
         "tags": ncaab_tag_ids(),
         "eventsFound": len(events),
         "eventsWithMarkets": sum(1 for e in events if e.get("markets")),
