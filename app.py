@@ -640,7 +640,8 @@ def find_value(odds_games, poly_events, min_edge):
 
         for m in ev.get("markets") or []:
             for o in m.get("outcomes") or []:
-                price = o.get("ask") if o.get("ask") is not None else o.get("price")
+                # Only real buy prices: a last-trade price can be hours old on a thin market
+                price = o.get("ask")
                 if price is None or not (0.02 < price < 0.98):
                     continue
                 if m["type"] == "moneyline":
@@ -669,8 +670,11 @@ def find_value(odds_games, poly_events, min_edge):
                     continue
                 if fair is None:
                     continue
-                compared += 1
                 edge = fair - price
+                # A gap this big almost always means mismatched lines or a stale market, not a real discount
+                if abs(edge) > 0.15:
+                    continue
+                compared += 1
                 if edge < min_edge:
                     continue
                 rows.append({
