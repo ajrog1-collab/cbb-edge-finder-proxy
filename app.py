@@ -622,16 +622,22 @@ def _dt_any(raw):
         return None
 
 
-def find_value(odds_games, poly_events, min_edge):
+def find_value(odds_games, poly_events, min_edge, stats=None):
     rows, compared = [], 0
+    st = stats if stats is not None else {}
+    bump = lambda k: st.__setitem__(k, st.get(k, 0) + 1)
     now = datetime.utcnow()
     for g in odds_games or []:
         start = _dt_any(g.get("commence_time"))
+        bump("games")
         if start and start <= now:
+            bump("games_started")
             continue  # started; prices are live, skip
         ev = _match_poly_event(g, poly_events)
         if not ev:
+            bump("games_no_polymarket_match")
             continue
+        bump("games_matched")
         home, away = g.get("home_team"), g.get("away_team")
 
         def team_for(name):
@@ -641,18 +647,22 @@ def find_value(odds_games, poly_events, min_edge):
         for m in ev.get("markets") or []:
             for o in m.get("outcomes") or []:
                 # Only real buy prices: a last-trade price can be hours old on a thin market
+                bump("sides_seen")
                 price = o.get("ask")
                 if price is None or not (0.02 < price < 0.98):
+                    bump("skip_no_buy_price")
                     continue
                 if m["type"] == "moneyline":
                     team = team_for(o.get("name"))
                     if not team:
+                        bump("skip_team_not_matched")
                         continue
                     fair, n = _consensus(g, "h2h", team)
                     label, side, line, kind = f"{team} to win", team, None, "moneyline"
                 elif m["type"] == "spreads":
                     team, line = team_for(o.get("name")), o.get("line")
                     if not team or line is None:
+                        bump("skip_team_or_line_not_matched")
                         continue
                     fair, n = _consensus(g, "spreads", team, line)
                     label, side, kind = f"{team} {line:+g}", team, "spread"
@@ -669,12 +679,21 @@ def find_value(odds_games, poly_events, min_edge):
                 else:
                     continue
                 if fair is None:
+                    bump(f"skip_under_2_books_at_line_{kind}")
                     continue
                 edge = fair - price
                 # A gap this big almost always means mismatched lines or a stale market, not a real discount
                 if abs(edge) > 0.15:
+                    bump("skip_gap_over_15c")
+                    st.setdefault("examples_big_gap", [])
+                    if len(st["examples_big_gap"]) < 6:
+                        st["examples_big_gap"].append({"bet": label, "game": f"{away} @ {home}", "price": price, "worth": round(fair, 3), "polyLine": line, "question": m.get("question")})
                     continue
                 compared += 1
+                c = edge * 100
+                bucket = "edge_below_-3c" if c < -3 else "edge_-3c_to_0" if c < 0 else "edge_0_to_1c" if c < 1 else "edge_1_to_2c" if c < 2 else "edge_2_to_3c" if c < 3 else "edge_3c_plus"
+                bump(bucket)
+                st.setdefault("_all", []).append((edge, label, f"{away} @ {home}", price, fair, n))
                 if edge < min_edge:
                     continue
                 rows.append({
@@ -688,6 +707,21 @@ def find_value(odds_games, poly_events, min_edge):
                 })
     rows.sort(key=lambda r: -r["edge"])
     return rows, compared
+
+
+@app.route("/api/value/debug")
+def value_debug():
+    """Why value bets do or don't appear: counts at each step, edge distribution, closest calls."""
+    odds = cached("odds", 300, lambda: odds_get("/sports/basketball_ncaab/odds/", {
+        "regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "american"}))
+    poly = cached("poly:ncaab", 300, fetch_poly_ncaab)
+    stats = {}
+    find_value(odds, poly, -1, stats)
+    allc = sorted(stats.pop("_all", []), key=lambda r: -r[0])
+    stats["closest_to_value"] = [{"bet": b, "game": g, "price": round(p, 3), "worth": round(f, 3),
+                                  "edgeCents": round(e * 100, 2), "books": n} for e, b, g, p, f, n in allc[:12]]
+    stats["polymarket_games_listed"] = len(poly)
+    return jsonify(stats)
 
 
 @app.route("/api/value")
