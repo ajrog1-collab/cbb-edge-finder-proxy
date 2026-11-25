@@ -324,10 +324,10 @@ def get_teams():
 
 @app.route("/api/odds")
 def get_odds():
-    """Current NCAAB spreads and totals. Cached 5 minutes. Costs 2 Odds API credits per uncached call."""
+    """Current NCAAB moneylines, spreads and totals. Cached 5 minutes. Costs 3 Odds API credits per uncached call."""
     data = cached("odds", 300, lambda: odds_get("/sports/basketball_ncaab/odds/", {
         "regions": "us",
-        "markets": "spreads,totals",
+        "markets": "h2h,spreads,totals",
         "oddsFormat": "american",
     }))
     return jsonify(data)
@@ -407,6 +407,29 @@ def ncaab_tag_ids():
     return cached("poly:ncaab_tags", 86400, fetch)
 
 
+def _fnum(v):
+    try:
+        f = float(v)
+        return f if f == f else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _norm(name):
+    return re.sub(r"[^a-z0-9]", "", str(name or "").lower().replace("state", "st"))
+
+
+def _name_score(a, b):
+    """How well two team names match (0 = no match). Handles 'Virginia' vs 'Virginia Cavaliers'."""
+    x, y = _norm(a), _norm(b)
+    if not x or not y:
+        return 0
+    if x == y:
+        return 100
+    short, long_ = (x, y) if len(x) <= len(y) else (y, x)
+    return 50 + len(short) if long_.startswith(short) and len(short) >= 4 else 0
+
+
 def market_type(m):
     t = m.get("sportsMarketType") or (m.get("sports") or {}).get("sportsMarketType")
     if t:
@@ -425,14 +448,26 @@ def market_type(m):
 def normalize_market(m):
     names = _jsonish(m.get("outcomes"))
     prices = _jsonish(m.get("outcomePrices"))
+    # Cost to buy each side: first outcome = best ask; second = 1 - best bid (order book is shared)
+    ask0, bid0 = _fnum(m.get("bestAsk")), _fnum(m.get("bestBid"))
+    asks = [ask0, (1 - bid0) if bid0 is not None else None]
     outcomes = []
     for i, name in enumerate(names):
         try:
             p = float(prices[i])
         except (IndexError, TypeError, ValueError):
             p = None
-        outcomes.append({"name": name, "price": p, "americanOdds": _american(p),
+        ask = asks[i] if i < 2 and asks[i] is not None and 0 < asks[i] < 1 else None
+        outcomes.append({"name": name, "price": p, "ask": ask, "americanOdds": _american(p),
                          "breakevenPct": round(p * 100, 1) if p else None})
+    # Spread line for each side, from a question like "Spread: Virginia (-2.5)"
+    if market_type(m) == "spreads":
+        mq = re.search(r"(?:spread:\s*)?(.+?)\s*\(([+-]?\d+(?:\.\d+)?)\)", str(m.get("question") or ""), re.I)
+        if mq and len(outcomes) == 2:
+            team, val = mq.group(1).strip(), float(mq.group(2))
+            first_is_team = _name_score(outcomes[0]["name"], team) >= _name_score(outcomes[1]["name"], team)
+            outcomes[0]["line"] = val if first_is_team else -val
+            outcomes[1]["line"] = -val if first_is_team else val
     return {
         "type": market_type(m),   # moneyline | spreads | totals | ...
         "line": m.get("line"),
@@ -526,6 +561,145 @@ def fetch_poly_ncaab():
             "tradeUrl": f"{POLY_TRADE_BASE}/{base}" if m else POLY_TRADE_BASE,
         }
     return list(games.values())
+
+
+# ============================================================
+# Value finder: Polymarket price vs sportsbook consensus
+# ============================================================
+
+def _implied(american):
+    a = _fnum(american)
+    if a is None or a == 0:
+        return None
+    return 100 / (a + 100) if a > 0 else -a / (-a + 100)
+
+
+def _consensus(game, market, pick_name, line=None):
+    """Average no-vig probability for one side across books offering the same line. None if < 2 books."""
+    probs = []
+    for b in game.get("bookmakers") or []:
+        mk = next((m for m in b.get("markets") or [] if m.get("key") == market), None)
+        if not mk or len(mk.get("outcomes") or []) != 2:
+            continue
+        o = mk["outcomes"]
+        i = next((k for k in (0, 1) if _norm(o[k].get("name")) == _norm(pick_name)), None)
+        if i is None:
+            continue
+        if line is not None and _fnum(o[i].get("point")) != line:
+            continue
+        p1, p2 = _implied(o[i].get("price")), _implied(o[1 - i].get("price"))
+        if p1 and p2:
+            probs.append(p1 / (p1 + p2))
+    return (sum(probs) / len(probs), len(probs)) if len(probs) >= 2 else (None, len(probs))
+
+
+def _match_poly_event(game, events):
+    t = _dt_any(game.get("commence_time"))
+    best, best_score = None, 0
+    for ev in events:
+        names = [n for n in (ev.get("homeTeam"), ev.get("awayTeam")) if n]
+        if len(names) < 2 and ev.get("title"):
+            names = re.split(r"\s+(?:vs\.?|@|at)\s+", ev["title"], flags=re.I)
+        if len(names) != 2:
+            continue
+        h, a = game.get("home_team"), game.get("away_team")
+        score = max(min(_name_score(names[0], h), _name_score(names[1], a)),
+                    min(_name_score(names[0], a), _name_score(names[1], h)))
+        if score <= 0:
+            continue
+        st = _dt_any(ev.get("startTime"))
+        if t and st and abs((st - t).total_seconds()) > 36 * 3600:
+            continue
+        if score > best_score:
+            best, best_score = ev, score
+    return best
+
+
+def _dt_any(raw):
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        return None
+
+
+def find_value(odds_games, poly_events, min_edge):
+    rows, compared = [], 0
+    now = datetime.utcnow()
+    for g in odds_games or []:
+        start = _dt_any(g.get("commence_time"))
+        if start and start <= now:
+            continue  # started; prices are live, skip
+        ev = _match_poly_event(g, poly_events)
+        if not ev:
+            continue
+        home, away = g.get("home_team"), g.get("away_team")
+
+        def team_for(name):
+            sh, sa = _name_score(name, home), _name_score(name, away)
+            return (home if sh >= sa else away) if max(sh, sa) > 0 else None
+
+        for m in ev.get("markets") or []:
+            for o in m.get("outcomes") or []:
+                price = o.get("ask") if o.get("ask") is not None else o.get("price")
+                if price is None or not (0.02 < price < 0.98):
+                    continue
+                if m["type"] == "moneyline":
+                    team = team_for(o.get("name"))
+                    if not team:
+                        continue
+                    fair, n = _consensus(g, "h2h", team)
+                    label, side, line, kind = f"{team} to win", team, None, "moneyline"
+                elif m["type"] == "spreads":
+                    team, line = team_for(o.get("name")), o.get("line")
+                    if not team or line is None:
+                        continue
+                    fair, n = _consensus(g, "spreads", team, line)
+                    label, side, kind = f"{team} {line:+g}", team, "spread"
+                elif m["type"] == "totals":
+                    nm = str(o.get("name", "")).lower()
+                    line = _fnum(m.get("line"))
+                    if line is None:
+                        nums = re.findall(r"\d+(?:\.\d+)?", str(m.get("question") or ""))
+                        line = float(nums[-1]) if nums else None
+                    if nm not in ("over", "under") or line is None:
+                        continue
+                    fair, n = _consensus(g, "totals", nm.capitalize(), line)
+                    label, side, kind = f"{nm.capitalize()} {line:g}", nm, "total"
+                else:
+                    continue
+                if fair is None:
+                    continue
+                compared += 1
+                edge = fair - price
+                if edge < min_edge:
+                    continue
+                rows.append({
+                    "id": f"{g.get('id')}_{kind}_{_norm(side)}_{line if line is not None else 'ml'}",
+                    "gameId": g.get("id"), "homeTeam": home, "awayTeam": away,
+                    "startTime": g.get("commence_time"), "type": kind, "side": side, "line": line,
+                    "label": label, "polyPrice": round(price, 3),
+                    "priceType": "ask" if o.get("ask") is not None else "last",
+                    "fairProb": round(fair, 3), "edge": round(edge, 3), "books": n,
+                    "tradeUrl": ev.get("tradeUrl"),
+                })
+    rows.sort(key=lambda r: -r["edge"])
+    return rows, compared
+
+
+@app.route("/api/value")
+def get_value():
+    """Bets where Polymarket's price is below the sportsbook consensus (no-vig) probability.
+    Edge = books' fair probability - Polymarket price. Uses only books posting the same line."""
+    try:
+        min_edge = float(request.args.get("minEdge", "0.03"))
+    except ValueError:
+        raise BadRequest("minEdge must be a number like 0.03")
+    odds = cached("odds", 300, lambda: odds_get("/sports/basketball_ncaab/odds/", {
+        "regions": "us", "markets": "h2h,spreads,totals", "oddsFormat": "american"}))
+    poly = cached("poly:ncaab", 300, fetch_poly_ncaab)
+    rows, compared = find_value(odds, poly, min_edge)
+    return jsonify({"minEdge": min_edge, "compared": compared, "opportunities": rows,
+                    "note": "Prices from Polymarket's public data. Confirm the price on Polymarket US before trading."})
 
 
 @app.route("/api/polymarket/debug")
