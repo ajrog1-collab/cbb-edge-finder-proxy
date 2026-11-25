@@ -545,6 +545,29 @@ def get_polymarket():
     return jsonify(cached("poly:ncaab", 300, fetch_poly_ncaab))
 
 
+@app.route("/api/backtest")
+def backtest():
+    """Leak-free walk-forward test of the rebuilt model on a finished season. Default: last season."""
+    from model import run_backtest
+    season = parse_season(request.args.get("season") or str(current_season() - 1))
+    s_start, s_end = season_window(season)
+    end = min(today_et(), s_end)
+    key = f"backtest:{season}:{request.query_string.decode()}"
+
+    def run():
+        games = fetch_ranged("/games", season, s_start, end, "games")
+        lines = fetch_ranged("/lines", season, s_start, end, "lines")
+        kw = {}
+        for arg, name, cast in (("lambdaSpread", "lam_spread", float), ("lambdaTotal", "lam_total", float),
+                                ("halfLife", "half_life", float)):
+            if request.args.get(arg):
+                kw[name] = cast(request.args[arg])
+        result = run_backtest(games, lines, **kw)
+        result["season"] = season
+        return result
+    return jsonify(cached(key, 6 * 3600, run))
+
+
 @app.route("/api/diagnose")
 def diagnose():
     """Tests each connection without spending Odds API credits. Open this in a browser when refresh fails."""
