@@ -42,3 +42,12 @@ Open `https://<your-proxy>.onrender.com/api/diagnose` in a browser. Each check s
 American-odds equivalent, and breakeven %. Data comes from Polymarket's free public API (no key).
 If the site shows no Polymarket prices, open `/api/polymarket/debug` and send the output for troubleshooting.
 `tradeUrl` points to Polymarket US (the regulated US exchange). Override with env var `POLYMARKET_TRADE_URL`.
+
+## Value finder
+`/api/value?minEdge=0.03` compares each Polymarket price (the ask, i.e. cost to buy) with the sportsbooks'
+consensus no-vig probability for the same bet at the same line (2+ books required). Edge = fair probability − price.
+Odds now include moneylines, so each uncached `/api/odds` call costs 3 Odds API credits (cached 5 minutes).
+
+## Backtest
+`/api/backtest` runs a leak-free walk-forward test of a ridge-ratings model on last season (runs in the background;
+refresh to see progress). 2025-26 result: 50.3% vs closing spreads, 50.2% on totals, so model picks are shown as unproven "leans".
