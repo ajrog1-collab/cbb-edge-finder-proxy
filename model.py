@@ -223,7 +223,8 @@ def _calibration(bets):
     return out
 
 
-def run_backtest(raw_games, raw_lines, warmup_days=21, refit_days=7, lam_spread=2.0, lam_total=3.0, half_life=45):
+def run_backtest(raw_games, raw_lines, warmup_days=21, refit_days=7, lam_spread=2.0, lam_total=3.0, half_life=45,
+                 progress=None):
     games = prep_games(raw_games)
     by_id, by_key = prep_lines(raw_lines)
     if len(games) < 200:
@@ -238,7 +239,12 @@ def run_backtest(raw_games, raw_lines, warmup_days=21, refit_days=7, lam_spread=
     sign_checks = []  # does the line agree with the model on who is favored? (catches flipped line signs)
 
     cur = start
+    total_weeks = max(1, (end - start).days // refit_days + 1)
+    week = 0
     while cur <= end:
+        week += 1
+        if progress:
+            progress(f"Testing week {week} of {total_weeks}")
         nxt = cur + timedelta(days=refit_days)
         train = [g for g in games if g["date"] < cur]
         test = [g for g in games if cur <= g["date"] < nxt]
