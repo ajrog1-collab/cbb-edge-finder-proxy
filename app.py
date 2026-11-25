@@ -118,6 +118,19 @@ def handle_bad_request(e):
     return jsonify({"error": str(e)}), 400
 
 
+@app.errorhandler(Exception)
+def handle_unexpected(e):
+    """Any unexpected crash returns a readable JSON message instead of a blank 'Internal Server Error'."""
+    import traceback
+    from werkzeug.exceptions import HTTPException
+    if isinstance(e, HTTPException):
+        return e
+    tb = traceback.extract_tb(e.__traceback__)
+    where = [f"{f.filename.split('/')[-1]}:{f.lineno} in {f.name}" for f in tb[-3:]]
+    app.logger.exception("Unhandled error")
+    return jsonify({"error": f"{e.__class__.__name__}: {e}", "where": where}), 500
+
+
 @app.errorhandler(UpstreamError)
 def handle_upstream(e):
     # Pass auth and quota codes through so the browser shows a meaningful status.
