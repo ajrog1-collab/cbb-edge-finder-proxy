@@ -355,16 +355,38 @@ def _american(p):
     return round(-100 * p / (1 - p)) if p >= 0.5 else round(100 * (1 - p) / p)
 
 
+def ncaab_sport_entry():
+    def fetch():
+        sports = gamma_get("/sports")
+        return next((s for s in sports if s.get("sport") in ("ncaab", "cbb")), {}), sports
+    return cached("poly:sports", 86400, fetch)
+
+
 def ncaab_tag_ids():
     """Find tags unique to NCAAB (drops generic tags shared with other sports)."""
     def fetch():
-        sports = gamma_get("/sports")
+        _, sports = ncaab_sport_entry()
         by_sport = {s.get("sport"): {t for t in str(s.get("tags", "")).split(",") if t} for s in sports}
         mine = by_sport.get("ncaab") or by_sport.get("cbb") or set()
         others = set().union(*[v for k, v in by_sport.items() if k not in ("ncaab", "cbb")]) if by_sport else set()
         specific = mine - others
         return sorted(specific or mine)
     return cached("poly:ncaab_tags", 86400, fetch)
+
+
+def market_type(m):
+    t = m.get("sportsMarketType") or (m.get("sports") or {}).get("sportsMarketType")
+    if t:
+        return t
+    q = f"{m.get('question') or ''} {m.get('slug') or ''}".lower()
+    if "spread" in q:
+        return "spreads"
+    if "o/u" in q or "total" in q or "over/under" in q:
+        return "totals"
+    names = [str(n).lower() for n in _jsonish(m.get("outcomes"))]
+    if len(names) == 2 and set(names) != {"yes", "no"}:
+        return "moneyline"
+    return "other"
 
 
 def normalize_market(m):
@@ -379,7 +401,7 @@ def normalize_market(m):
         outcomes.append({"name": name, "price": p, "americanOdds": _american(p),
                          "breakevenPct": round(p * 100, 1) if p else None})
     return {
-        "type": m.get("sportsMarketType") or "other",   # moneyline | spreads | totals | ...
+        "type": market_type(m),   # moneyline | spreads | totals | ...
         "line": m.get("line"),
         "question": m.get("question"),
         "slug": m.get("slug"),
@@ -390,12 +412,21 @@ def normalize_market(m):
     }
 
 
-def fetch_poly_ncaab():
+def _event_start(e):
+    return e.get("startTime") or e.get("gameStartTime") or e.get("startDate") or e.get("endDate")
+
+
+def fetch_poly_events():
+    """Open NCAAB events, found by NCAAB tag(s) and, if Polymarket lists one, the NCAAB series."""
+    entry, _ = ncaab_sport_entry()
+    queries = [{"tag_id": t} for t in ncaab_tag_ids()]
+    if entry.get("series"):
+        queries.append({"series_id": entry["series"]})
     events = []
-    for tag in ncaab_tag_ids():
+    for q in queries:
         cursor = None
         for _ in range(20):  # page cap
-            params = {"tag_id": tag, "closed": "false", "limit": 100}
+            params = {**q, "closed": "false", "limit": 100}
             if cursor:
                 params["after_cursor"] = cursor
             page = gamma_get("/events/keyset", params)
@@ -404,6 +435,28 @@ def fetch_poly_ncaab():
             cursor = page.get("next_cursor") if isinstance(page, dict) else None
             if not cursor or not batch:
                 break
+    return events
+
+
+def fetch_poly_ncaab():
+    events = fetch_poly_events()
+    # Some listings omit nested markets: fetch full detail for games in the next 4 days (capped).
+    soon = datetime.utcnow() + timedelta(days=4)
+    detail_budget = 60
+    for i, e in enumerate(events):
+        if e.get("markets") or detail_budget <= 0 or not e.get("slug"):
+            continue
+        st = _event_start(e)
+        try:
+            if st and datetime.fromisoformat(str(st).replace("Z", "+00:00")).replace(tzinfo=None) > soon:
+                continue
+        except ValueError:
+            pass
+        detail_budget -= 1
+        try:
+            events[i] = cached(f"poly:event:{e['slug']}", 300, lambda s=e["slug"]: gamma_get(f"/events/slug/{s}"))
+        except UpstreamError:
+            pass
     out, seen = [], set()
     for e in events:
         if e.get("id") in seen:
@@ -421,12 +474,32 @@ def fetch_poly_ncaab():
             "title": e.get("title"),
             "homeTeam": home,
             "awayTeam": away,
-            "startTime": e.get("startTime") or e.get("gameStartTime") or e.get("endDate"),
+            "startTime": _event_start(e),
             "markets": markets,
             "dataUrl": f"https://polymarket.com/event/{e.get('slug')}",
             "tradeUrl": POLY_TRADE_BASE,
         })
     return out
+
+
+@app.route("/api/polymarket/debug")
+def polymarket_debug():
+    """Shows what Polymarket returned, to troubleshoot matching. Not used by the site."""
+    entry, _ = ncaab_sport_entry()
+    events = fetch_poly_events()
+    sample = events[0] if events else {}
+    m0 = (sample.get("markets") or [{}])[0] if sample else {}
+    return jsonify({
+        "sportEntry": entry,
+        "tags": ncaab_tag_ids(),
+        "eventsFound": len(events),
+        "eventsWithMarkets": sum(1 for e in events if e.get("markets")),
+        "games": len(cached("poly:ncaab", 300, fetch_poly_ncaab)),
+        "sampleEventKeys": sorted(sample.keys()) if sample else [],
+        "sampleEventTitle": sample.get("title"),
+        "sampleMarketKeys": sorted(m0.keys()) if m0 else [],
+        "sampleMarket": {k: m0.get(k) for k in ("question", "sportsMarketType", "line", "outcomes", "outcomePrices")} if m0 else {},
+    })
 
 
 @app.route("/api/polymarket")
