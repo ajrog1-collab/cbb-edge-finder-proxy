@@ -37,6 +37,13 @@ app = Flask(__name__)
 CBBD_API_KEY = os.environ.get("CBBD_API_KEY", "").strip()
 ODDS_API_KEY = os.environ.get("ODDS_API_KEY", "").strip()
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+# Password for every data endpoint (set in Render). Visitors never call the proxy: the site reads saved data.
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+# Lets the site's "Refresh Data" button start the scheduled GitHub job so everyone gets new data
+GH_TOKEN = os.environ.get("GH_TOKEN", "").strip()
+GH_REPO = os.environ.get("GH_REPO", "").strip()            # e.g. ajrog1-collab/the-spread-sheet
+GH_WORKFLOW = os.environ.get("GH_WORKFLOW", "refresh.yml").strip()
+GH_BRANCH = os.environ.get("GH_BRANCH", "main").strip()
 
 CBBD_BASE = "https://api.collegebasketballdata.com"
 ODDS_BASE = "https://api.the-odds-api.com/v4"
@@ -250,7 +257,8 @@ def add_cors(resp):
     elif origin and origin in ALLOWED_ORIGINS:
         resp.headers["Access-Control-Allow-Origin"] = origin
         resp.headers["Vary"] = "Origin"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, ngrok-skip-browser-warning"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, ngrok-skip-browser-warning, X-Admin-Token"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
     return resp
 
@@ -258,6 +266,58 @@ def add_cors(resp):
 # ============================================================
 # Routes
 # ============================================================
+
+import hmac
+
+
+def _token_ok():
+    if not ADMIN_TOKEN:
+        return True   # not configured yet: open, as before
+    given = request.headers.get("X-Admin-Token") or request.args.get("key") or ""
+    return hmac.compare_digest(given.encode(), ADMIN_TOKEN.encode())
+
+
+@app.before_request
+def require_admin():
+    """Every /api/ route needs the password. /health stays open; browser preflight checks pass through."""
+    if request.method == "OPTIONS" or not request.path.startswith("/api/"):
+        return None
+    if not _token_ok():
+        resp = jsonify({"error": "Password required. Add ?key=YOUR_PASSWORD to open this page in a browser."})
+        resp.status_code = 401
+        return resp
+    return None
+
+
+_last_dispatch = {"at": 0.0}
+
+
+@app.route("/api/admin/check")
+def admin_check():
+    return jsonify({"ok": True, "refreshForEveryone": bool(GH_TOKEN and GH_REPO)})
+
+
+@app.route("/api/admin/refresh", methods=["POST"])
+def admin_refresh():
+    """Start the GitHub 'Refresh data' workflow (same job as the 9 AM / 5 PM runs)."""
+    if not (GH_TOKEN and GH_REPO):
+        return jsonify({"started": False, "error": "GH_TOKEN and GH_REPO are not set in Render."}), 400
+    if time.time() - _last_dispatch["at"] < 300:
+        return jsonify({"started": False, "error": "A refresh was started less than 5 minutes ago."}), 429
+    try:
+        r = session.post(f"https://api.github.com/repos/{GH_REPO}/actions/workflows/{GH_WORKFLOW}/dispatches",
+                         json={"ref": GH_BRANCH}, timeout=20,
+                         headers={"Authorization": f"Bearer {GH_TOKEN}", "Accept": "application/vnd.github+json",
+                                  "X-GitHub-Api-Version": "2022-11-28"})
+    except requests.RequestException as e:
+        return jsonify({"started": False, "error": f"Could not reach GitHub: {e.__class__.__name__}"}), 502
+    if r.status_code == 204:
+        _last_dispatch["at"] = time.time()
+        return jsonify({"started": True})
+    msg = {401: "GitHub rejected GH_TOKEN.", 403: "GH_TOKEN lacks Actions read/write permission.",
+           404: "Repo or workflow not found: check GH_REPO and GH_WORKFLOW."}.get(r.status_code, f"GitHub returned {r.status_code}")
+    return jsonify({"started": False, "error": msg}), 502
+
 
 @app.route("/")
 @app.route("/health")
@@ -268,6 +328,7 @@ def health():
         "season": current_season(),
         "today": today_et().isoformat(),
         "keys": {"cbbd": bool(CBBD_API_KEY), "odds": bool(ODDS_API_KEY)},
+        "passwordSet": bool(ADMIN_TOKEN), "refreshForEveryone": bool(GH_TOKEN and GH_REPO),
         "startedAt": STARTED_AT,
     })
 
