@@ -18,6 +18,7 @@ Environment variables (set in Render):
 """
 
 import os
+import re
 import time
 import threading
 from datetime import datetime, date, timedelta
@@ -324,7 +325,9 @@ def get_odds():
 # ============================================================
 
 GAMMA_BASE = "https://gamma-api.polymarket.com"
-POLY_TRADE_BASE = os.environ.get("POLYMARKET_TRADE_URL", "https://polymarket.us")
+# Polymarket US game pages look like https://polymarket.us/sports/cbb/cbb-marq-vir-2026-11-25
+POLY_TRADE_BASE = os.environ.get("POLYMARKET_TRADE_URL", "https://polymarket.us/sports/cbb").rstrip("/")
+GAME_SLUG_RE = re.compile(r"^(cbb-[a-z0-9]+-[a-z0-9]+-\d{4}-\d{2}-\d{2})")
 
 
 def gamma_get(path, params=None):
@@ -475,7 +478,7 @@ def fetch_poly_ncaab():
             events[i] = cached(f"poly:event:{e['slug']}", 300, lambda s=e["slug"]: gamma_get(f"/events/slug/{s}"))
         except UpstreamError:
             pass
-    out, seen = [], set()
+    games, seen = {}, set()
     for e in events:
         if e.get("id") in seen:
             continue
@@ -487,17 +490,29 @@ def fetch_poly_ncaab():
         markets = [m for m in markets if m["type"] in ("moneyline", "spreads", "totals")]
         if not markets:
             continue
-        out.append({
-            "eventSlug": e.get("slug"),
+        slug = e.get("slug") or ""
+        m = GAME_SLUG_RE.match(slug)
+        base = m.group(1) if m else slug
+        g = games.get(base)
+        if g:
+            g["markets"].extend(markets)
+            g["homeTeam"] = g["homeTeam"] or home
+            g["awayTeam"] = g["awayTeam"] or away
+            if slug == base:
+                g["title"] = e.get("title") or g["title"]
+            continue
+        games[base] = {
+            "eventSlug": base,
             "title": e.get("title"),
             "homeTeam": home,
             "awayTeam": away,
             "startTime": _event_start(e),
             "markets": markets,
-            "dataUrl": f"https://polymarket.com/event/{e.get('slug')}",
-            "tradeUrl": POLY_TRADE_BASE,
-        })
-    return out
+            "dataUrl": f"https://polymarket.com/event/{base}",
+            # Opens the game page on Polymarket US. Linking to one specific bet isn't supported.
+            "tradeUrl": f"{POLY_TRADE_BASE}/{base}" if m else POLY_TRADE_BASE,
+        }
+    return list(games.values())
 
 
 @app.route("/api/polymarket/debug")
