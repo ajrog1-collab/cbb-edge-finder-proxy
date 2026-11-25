@@ -341,6 +341,55 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 # Polymarket US game pages look like https://polymarket.us/sports/cbb/cbb-marq-vir-2026-11-25
 POLY_TRADE_BASE = os.environ.get("POLYMARKET_TRADE_URL", "https://polymarket.us/sports/cbb").rstrip("/")
 GAME_SLUG_RE = re.compile(r"^(cbb-[a-z0-9]+-[a-z0-9]+-\d{4}-\d{2}-\d{2})")
+US_GATEWAY = "https://gateway.polymarket.us/v1/events/slug/"
+
+
+def us_slug_exists(slug):
+    """True/False from Polymarket US's public gateway; None if it could not be checked. Cached."""
+    key = f"usslug:{slug}"
+    now = time.time()
+    with _cache_lock:
+        hit = _cache.get(key)
+        if hit and hit[0] > now:
+            return hit[1]
+    try:
+        r = session.get(US_GATEWAY + slug, timeout=10, headers={"User-Agent": "cbb-edge-finder-proxy"})
+    except requests.RequestException:
+        return None
+    usage["polymarketUsCalls"] = usage.get("polymarketUsCalls", 0) + 1
+    if r.status_code == 200:
+        found, ttl = True, 12 * 3600
+    elif r.status_code == 404:
+        found, ttl = False, 3 * 3600
+    else:
+        return None   # rate limited or down: don't cache, try again later
+    with _cache_lock:
+        _cache[key] = (now + ttl, found)
+    return found
+
+
+def us_trade_url(base_slug):
+    """Polymarket US sometimes lists a game with the teams in the other order (cbb-smu-utahst vs
+    cbb-utahst-smu) or under the next/previous date. Check the real slug on Polymarket US."""
+    m = re.match(r"^cbb-([a-z0-9]+)-([a-z0-9]+)-(\d{4}-\d{2}-\d{2})$", base_slug or "")
+    if not m:
+        return POLY_TRADE_BASE
+    a, b, d = m.groups()
+    day = date.fromisoformat(d)
+    dates = [day, day - timedelta(days=1), day + timedelta(days=1)]
+    candidates = []
+    for dd in dates:
+        candidates += [f"cbb-{a}-{b}-{dd.isoformat()}", f"cbb-{b}-{a}-{dd.isoformat()}"]
+    unknown = False
+    for c in candidates:
+        found = us_slug_exists(c)
+        if found:
+            return f"{POLY_TRADE_BASE}/{c}"
+        if found is None:
+            unknown = True
+            break
+    # Gateway unreachable: best guess is the international slug. Confirmed missing: the CBB page.
+    return f"{POLY_TRADE_BASE}/{base_slug}" if unknown else POLY_TRADE_BASE
 
 
 def gamma_get(path, params=None):
@@ -557,9 +606,10 @@ def fetch_poly_ncaab():
             "startTime": _event_start(e),
             "markets": markets,
             "dataUrl": f"https://polymarket.com/event/{base}",
-            # Opens the game page on Polymarket US. Linking to one specific bet isn't supported.
-            "tradeUrl": f"{POLY_TRADE_BASE}/{base}" if m else POLY_TRADE_BASE,
+            "tradeUrl": None,   # filled in below from Polymarket US's own slug
         }
+    for gm in games.values():
+        gm["tradeUrl"] = us_trade_url(gm["eventSlug"]) if GAME_SLUG_RE.match(gm["eventSlug"] or "") else POLY_TRADE_BASE
     return list(games.values())
 
 
